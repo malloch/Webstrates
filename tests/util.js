@@ -24,6 +24,10 @@ util.escapeRegExp = function(s) {
 	return s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
 };
 
+util.webstrateIdRegex =  (config.server && config.server.niceWebstrateIds)
+	? '([a-z]{2,13}-[a-z]{2,13}-\\d{1,3})'
+	: '([A-z0-9-]{8,10})';
+
 // Remove HTTP basic auth credentials from the server address, e.g. http://web:strate@domain.tld/
 // becomes http://domain.tld/. Useful for comparing page URL with server address and for iframes,
 // as having credentials in iframe src attributes is prohibited.
@@ -36,18 +40,22 @@ util.isLocalhost = util.cleanServerAddress.match('https?://localhost') !== null;
 util.credentialsProvided = config.username && config.password;
 /**
  * Wait for predicate to become truthy or timeout.
- * @param  {Page}    page      Puppeteer page.
- * @param  {Function}  fn      Predicate function.
- * @param  {Number}    timeout Timeout in seconds.
+ * @param  {Page} page         Puppeteer page.
+ * @param  {Function} fn       Predicate function.
+ * @param  {Number} timeout    Timeout in seconds.
  * @param  {mixed} args        Arguments to pass to function.
  * @return {bool}              True if predicate became truthy false otherwise.
  * @public
  */
 util.waitForFunction = async function(page, fn, timeout = 1, ...args) {
+	if (typeof timeout !== 'number') {
+		throw new Error(`Invalid timeout: ${timeout}, expected number.`);
+	}
 	try {
 		await page.waitForFunction(fn, { timeout: timeout * 1000 }, ...args);
 	} catch (e) {
-		if (e.message.match(/^waiting failed: timeout \d+ms exceeded$/)) {
+		// Using (.*) wildcard to be compatible with error messages from older versions of Puppeteer.
+		if (e.message.match(/^waiting (.*)failed: timeout \d+ms exceeded$/)) {
 			return false;
 		}
 		throw e;
@@ -80,12 +88,14 @@ util.logInToGithub = async function(page) {
 		throw new Error(`Incorrect login page title: "${title}"`);
 	}
 
+	let navigationPromise = page.waitForNavigation({ waitUntil: 'networkidle2' });
+
 	await page.type('input#login_field', config.username);
 	await page.type('input#password', config.password);
 	await page.click('input[type=submit]');
 
 	// Wait for redirect to authorize URL.
-	await page.waitForNavigation({ waitUntil: 'networkidle2' });
+	await navigationPromise;
 
 	// Sleeping to circumvent bug: https://github.com/GoogleChrome/puppeteer/issues/1325
 	await util.sleep(1);
@@ -96,8 +106,9 @@ util.logInToGithub = async function(page) {
 		// It seems the login button isn't immediately available after page load (probably to prevent
 		// automation, woups...), so we wait for it to become clickable.
 		await util.sleep(3);
+		let navigationPromise = page.waitForNavigation({ waitUntil: 'networkidle2' });
 		await page.click('button[name=authorize]');
-		await page.waitForNavigation({ waitUntil: 'networkidle2' });
+		await navigationPromise;
 	}
 
 	url = await page.url();
@@ -113,6 +124,16 @@ util.logInToGithub = async function(page) {
 
 util.sleep = async function(seconds) {
 	return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+};
+
+util.waitForWebstrateLoaded = async (page) => {
+	await util.waitForFunction(page, async ()=>{
+		await new Promise((resolve, reject)=>{
+			window.webstrate.on("loaded",()=>{
+				resolve();
+			});
+		});
+	}, 2);
 };
 
 module.exports = util;

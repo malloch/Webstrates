@@ -34,6 +34,9 @@ const joinTimeouts = {};
 // clients.
 const userIds = {};
 
+// One-to-many mapping from userId to a user's client objects (including device type, IP, etc.)
+const userClients = {};
+
 // Listen for events happening on other server instances. This is only used when using multi-
 // threading and Redis.
 if (pubsub) {
@@ -48,10 +51,16 @@ if (pubsub) {
 
 		switch (message.action) {
 			case 'clientJoin':
+				//Only add non anonymous user clients
+				if (message.userId !== 'anonymous:') {
+					addUserClient(message.socketId, message.userId, message.userClient);
+				}
 				module.exports.addClientToWebstrate(message.socketId, message.userId, message.webstrateId);
 				break;
 			case 'clientPart':
-				module.exports.removeClientFromWebstrate(message.socketId, message.webstrateId);
+				module.exports.removeClientFromWebstrate(message.socketId, message.webstrateId,
+					message.userId);
+				removeUserClient(message.socketId, message.userId);
 				break;
 			case 'publish':
 				module.exports.publish(message.senderSocketId, message.webstrateId, message.nodeId,
@@ -60,6 +69,9 @@ if (pubsub) {
 			case 'signalUserObject':
 				module.exports.signalUserObject(message.userId, message.senderSocketId, message.message,
 					message.webstrateId);
+				break;
+			case 'newAsset':
+				module.exports.announceNewAsset(message.webstrateId, message.asset);
 				break;
 			case 'cookieUpdate':
 				module.exports.updateCookie(message.userId, message.webstrateId, message.update.key,
@@ -74,25 +86,41 @@ if (pubsub) {
 /**
  * Add client to ClientManager.
  * @param  {Socket} ws     Client socket.
+ * @param  {Socket} req    Express request object.
  * @param  {obj}    user   User object (OAuth credentials).
  * @return {string}        Generated socketId.
  * @public
  */
-module.exports.addClient = function(ws, user) {
+module.exports.addClient = function(ws, req, user) {
 	var socketId = shortId.generate();
 
 	if (!userIds[user.userId]) userIds[user.userId] = [];
 	userIds[user.userId].push(socketId);
 
+	// This is the object we'll make available on webstrate.user.allClients..
+	const userClient = {
+		socketId,
+		ipAddress: req.remoteAddress,
+		webstrateId: req.webstrateId,
+		userAgent: req.headers['user-agent']
+	};
+
+	//Only add non anonymous user clients
+	if (user.userId !== 'anonymous:') {
+		addUserClient(socketId, user.userId, userClient);
+	}
+
 	clients[socketId] = {
 		socket: ws,
+		userClient,
 		user: {
 			userId: user.userId,
 			username: user.username,
 			provider: user.provider,
 			displayName: user.displayName,
-			userUrl: user._json && user._json.html_url,
-			avatarUrl: user._json && (user._json.avatar_url || (user._json.image && user._json.image.url))
+			userUrl: user.userUrl || (user._json && user._json.html_url),
+			avatarUrl: user.avatarUrl ||
+				(user._json && (user._json.avatar_url || (user._json.image && user._json.image.url)))
 		},
 		webstrates: {} // contains a one-to-many mapping from webstrateIds to nodeIds.
 	};
@@ -100,6 +128,45 @@ module.exports.addClient = function(ws, user) {
 	messagingManager.clientAdded(socketId, user.userId, true);
 
 	return socketId;
+};
+
+/**
+ * Add a user client to userClients and broadcast it (so it ends up in webstrate.user.allClients).
+ * @param  {string} socketId   Unique ID generated for each socket.
+ * @param  {string} userId     userId (e.g. kbadk:github).
+ * @param  {mixed} userClient  User client object.
+ * @private
+ */
+const addUserClient = (socketId, userId, userClient) => {
+	userClients[userId] = userClients[userId] || {};
+	userClients[userId][socketId] = userClient;
+
+	module.exports.broadcastToUserClients(userId, {
+		wa: 'userClientJoin',
+		id: socketId,
+		userClient
+	});
+};
+
+/**
+ * Remove a user client from userClients and broadcast it (so it gets removed from
+ * webstrate.user.allClients).
+ * @param  {string} socketId   Unique ID generated for each socket.
+ * @param  {string} userId     userId (e.g. kbadk:github).
+ * @private
+ */
+const removeUserClient = (socketId, userId) => {
+	if (userClients[userId]) {
+		delete userClients[userId][socketId];
+	}
+
+	// There is no specific 'userClientPart' command, because we can just try to remove all
+	// parting clients from the clients and allClients lists. If we try to remove something that
+	// doesn't exist... Well, big whoop.
+	module.exports.broadcastToUserClients(userId, {
+		wa: 'clientPart',
+		id: socketId
+	});
 };
 
 /**
@@ -113,11 +180,14 @@ module.exports.removeClient = function(socketId) {
 		return;
 	}
 
+	const userId = clients[socketId].user && clients[socketId].user.userId;
+
 	Object.keys(clients[socketId].webstrates).forEach(function(webstrateId) {
-		module.exports.removeClientFromWebstrate(socketId, webstrateId, true);
+		module.exports.removeClientFromWebstrate(socketId, webstrateId, userId, true);
 	});
 
 	delete clients[socketId];
+	removeUserClient(socketId, userId);
 };
 
 module.exports.triggerJoin = function(socketId) {
@@ -176,6 +246,7 @@ module.exports.addClientToWebstrate = function(socketId, userId, webstrateId, lo
 	// Add a list of all the user's connected clients to the user object.
 	if (userId !== 'anonymous:') {
 		user.clients = [];
+		user.allClients = userClients[userId] || {};
 		webstrates[webstrateId].forEach((assUserId, socketId) => {
 			if (assUserId === userId) user.clients.push(socketId);
 		});
@@ -188,7 +259,7 @@ module.exports.addClientToWebstrate = function(socketId, userId, webstrateId, lo
 		d: webstrateId,
 		defaultPermissions: global.config.auth.defaultPermissions,
 		user: user,
-		clients: Array.from(webstrates[webstrateId].keys())
+		clients: Array.from(webstrates[webstrateId].keys()),
 	};
 
 	// If no userId is defined, the user isn't logged in and therefore can't have cookies attached,
@@ -260,7 +331,8 @@ module.exports.addClientToWebstrate = function(socketId, userId, webstrateId, lo
 		if (pubsub) {
 			const userId = clients[socketId].user.userId;
 			pubsub.publisher.publish(PUBSUB_CHANNEL, JSON.stringify({
-				action: 'clientJoin', userId, socketId, webstrateId, WORKER_ID
+				action: 'clientJoin', userClient: clients[socketId].userClient,
+				userId, socketId, webstrateId, WORKER_ID
 			}));
 		}
 	};
@@ -273,24 +345,29 @@ module.exports.addClientToWebstrate = function(socketId, userId, webstrateId, lo
  * Remove client from webstrate and broadcast departure.
  * @param {string} socketId    SocketId.
  * @param {string} webstrateId WebstrateId.
+ * @param {string} userId      UserId if user is logged in.
  * @param {bool}   local       Whether the client joined locally (on this server instance) or
  *                             remotely (on another server instance). We should only forward local
  *                             client joins, otherwise we end up in a livelock where we
  *                             continuously send the same join back and forth between instances.
  * @public
  */
-module.exports.removeClientFromWebstrate = function(socketId, webstrateId, local) {
+module.exports.removeClientFromWebstrate = function(socketId, webstrateId, userId, local) {
+
 	if (local) {
 		clients[socketId].webstrates[webstrateId].forEach(function(nodeId) {
 			module.exports.unsubscribe(socketId, webstrateId, nodeId);
 		});
 
 		if (pubsub) {
-			const userId = clients[socketId].user.userId;
 			pubsub.publisher.publish(PUBSUB_CHANNEL, JSON.stringify({
 				action: 'clientPart', userId, socketId, webstrateId, WORKER_ID
 			}));
 		}
+	}
+
+	if (userClients[userId]) {
+		delete userClients[userId][socketId];
 	}
 
 	var partFn = function() {
@@ -458,7 +535,7 @@ module.exports.signalUserObject = function(userId, senderSocketId, message, webs
 		sw: webstrateId,
 	});
 
-	if (local) {
+	if (local && pubsub) {
 		pubsub.publisher.publish(PUBSUB_CHANNEL, JSON.stringify({
 			action: 'signalUserObject', userId, senderSocketId, message, webstrateId, WORKER_ID
 		}));
@@ -466,15 +543,40 @@ module.exports.signalUserObject = function(userId, senderSocketId, message, webs
 };
 
 /**
+ * Send message all clients in a webstrate about a new asset.
+ * @param {string} webstrateId WebstrateId.
+ * @param {Object} asset       Asset object.
+ * @param {bool}   local       Whether the event has happened locally (on this server instance) or
+ *                             remotely (on another server instance). We should only forward local
+ *                             publish messages, otherwise we end up in a livelock where we
+ *                             continuously send the same event back and forth between instances.
+ * @public
+ */
+module.exports.announceNewAsset = function(webstrateId, asset, local) {
+	module.exports.sendToClients(webstrateId, {
+		wa: 'asset',
+		d: webstrateId,
+		asset: asset,
+	});
+
+	if (local && pubsub) {
+		pubsub.publisher.publish(PUBSUB_CHANNEL, JSON.stringify({
+			action: 'newAsset', webstrateId, asset, WORKER_ID
+		}));
+	}
+};
+
+
+/**
  * Update cookies. Any update made to a user's is sent to all of the user's conneted clients.
  * @param {string} userId  User Id (of the format <username>:<provider, e.g. "kbadk:github").
  * @param {string} webstrateId WebstrateId.
  * @param {string} key         Key to update (or add) in the cookie.
  * @param {string} value       Value associated with key.
- * @param {bool}   local       Whether the publis has happened locally (on this server
+ * @param {bool}   local       Whether the event has happened locally (on this server
  *                             instance) or remotely (on another server instance). We should
  *                             only forward local publish messages, otherwise we end up in a
- *                             livelock where we continuously send the same join back and
+ *                             livelock where we continuously send the same event back and
  *                             forth between instances.
  * @public
  */
@@ -493,13 +595,13 @@ module.exports.updateCookie = function(userId, webstrateId, key, value, local) {
 
 	if (local) {
 		var webstrateIdQuery = webstrateId || { '$exists': false };
-		db.cookies.update({ userId, webstrateId: webstrateIdQuery, cookies: { key } },
+		db.cookies.updateOne({ userId, webstrateId: webstrateIdQuery, cookies: { key } },
 			{ $set: { 'cookies.$.value': value } }, function(err, res) {
 				if (err) return console.error(err);
 				// If our update didn't update anything, we have to add it first. Maybe this could be done
 				// in one query, but as this point, I've given up trying to get clever with MongoDB.
 				if (res.result.nModified === 0) {
-					db.cookies.update({ userId, webstrateId: webstrateIdQuery },
+					db.cookies.updateOne({ userId, webstrateId: webstrateIdQuery },
 						// We still have to upsert, because even though the particular cookie key from above
 						// doesn't exist, the document may still exist.
 						{ $push: { cookies: { key, value } } }, { upsert: true }, function(err, res) {
@@ -603,7 +705,7 @@ function broadcastToUserClientsInWebstrate(webstrateId, userId, message) {
 }
 
 /**
- * Send message to all clients currently connected and logged in as userId.
+ * Send message to all clients currently connected and logged in as userId (locally).
  * @param  {string} userId  User Id (of the format <username>:<provider, e.g. "kbadk:github").
  * @param  {obj}    message     Message object.
  * @public

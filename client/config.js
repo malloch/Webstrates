@@ -15,9 +15,11 @@ module.exports = {
 		'permissions',
 		'tagging',
 		'clientManager',
+		'newWebstrates',
 		'signaling',
 		'signalStream',
 		'userObjectSignaling',
+		'userHistory',
 		'assets',
 		'messages',
 		'keepAlive'

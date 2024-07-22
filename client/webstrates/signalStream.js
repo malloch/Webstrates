@@ -123,11 +123,13 @@ function WebRTCClient(ownId, recipientId, clientRecipientId, node, { listener, s
 		peerConnection.onicecandidate = gotIceCandidate;
 		peerConnection.oniceconnectionstatechange = gotStateChange;
 		if (streamer) {
-			peerConnection.addStream(localStream);
+			localStream.getTracks().forEach((track)=>{
+				peerConnection.addTrack(track, localStream);
+			});
 			peerConnection.createOffer().then(createdDescription).catch(errorHandler);
 		}
 		if (listener) {
-			peerConnection.onaddstream = gotRemoteStream;
+			peerConnection.ontrack = gotRemoteStream;
 		}
 	};
 
@@ -183,7 +185,7 @@ function WebRTCClient(ownId, recipientId, clientRecipientId, node, { listener, s
 	};
 
 	const gotRemoteStream = (event) => {
-		onRemoteStreamCallback(event.stream);
+		onRemoteStreamCallback(event.streams[0]);
 	};
 
 	const errorHandler = (...error) => {
@@ -210,6 +212,11 @@ function setupSignalStream(publicObject, eventObject) {
 	// Text nodes and transient elements won't have wids, meaning there's way for us to signal on
 	// them, and thus it'd be pointless to add a signaling method and event.
 	if (!wid) return;
+
+	// Check if we already setup singal streaming
+	if(publicObject.signalStream != null) {
+		return;
+	}
 
 	webrtcClients.set(wid, new Map());
 	wantToStreamCallbacks.set(wid, new Map());
@@ -292,6 +299,11 @@ coreEvents.addEventListener('webstrateObjectsAdded', (nodes) => {
 
 // Add signalStream events to all webstrate objects (with wid) after they're added continually.
 coreEvents.addEventListener('webstrateObjectAdded', (node, eventObject) => {
+	setupSignalStream(node.webstrate, eventObject);
+}, coreEvents.PRIORITY.IMMEDIATE);
+
+// Listen for when webstrate.id and wid is ready on webstrateObjects
+coreEvents.addEventListener('webstrateObjectAddedId', (node, eventObject) => {
 	setupSignalStream(node.webstrate, eventObject);
 }, coreEvents.PRIORITY.IMMEDIATE);
 

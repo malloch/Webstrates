@@ -25,7 +25,9 @@ if (!coreUtils.getLocationObject().staticMode) {
 	const websocket = coreWebsocket.copy((event) => event.data.startsWith('{"wa":'));
 	const webstrateId = coreUtils.getLocationObject().webstrateId;
 
-	let clientId, clients;
+	// We initialize clients, so we won't do splice/indexOf if we receive a clientPart
+	// event before a hello event.
+	let clientId, clients = [];
 
 	Object.defineProperty(globalObject.publicObject, 'clients', {
 		get: () => coreUtils.objectCloneAndLock(clients)
@@ -70,7 +72,14 @@ if (!coreUtils.getLocationObject().staticMode) {
 
 			case 'clientPart': {
 				const partingClientId = message.id;
-				clients.splice(clients.indexOf(partingClientId), 1);
+				const partingClientIdIdx = clients.indexOf(partingClientId);
+				// If we haven't registered the client joining, don't register it leaving (and also don't
+				// try to remove it from the client list. That won't end well.)
+				if (partingClientIdIdx === -1) {
+					return;
+				}
+
+				clients.splice(partingClientIdIdx, 1);
 
 				// Trigger internally.
 				coreEvents.triggerEvent('clientPart', partingClientId);

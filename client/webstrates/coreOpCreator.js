@@ -73,7 +73,7 @@ function attributeMutation(mutation, targetPathNode) {
 		return;
 	}
 
-	// MongoDB doesn't support periods (.) i nkeys, so we store them as &dot; instead.
+	// MongoDB doesn't support periods (.) in keys, so we store them as &dot; instead.
 	const cleanAttributeName = coreUtils.escapeDots(mutation.attributeName);
 	const targetPathNodeJsonML = targetPathNode.toPath();
 	const path = [...targetPathNodeJsonML, ATTRIBUTE_INDEX, cleanAttributeName];
@@ -96,8 +96,6 @@ function attributeMutation(mutation, targetPathNode) {
 	// setting an attribute's value for the first time), we have to create the operation manually.
 	// The second condition should not be true without the first one, but it will if the changes
 	// happen so rapidly, that the browser skipped a MutationRecord. Or that's my theory, at least.
-	// We are lose about checking jsonmlAttrs[attributeName], because we don't want to
-	// diff, regardless of whether it's an empty string or it's null.
 	// Also, if the newValue is short, it's easier and faster to just send it rather than patch it.
 	// And lastly, if we're throttling ops (meaning we're not sending all of them), we can't create
 	// diffs as diffs only work between two known states, but we won't know the previous state if we
@@ -106,7 +104,7 @@ function attributeMutation(mutation, targetPathNode) {
 	let ops;
 	if (oldValue === null || newValue.length < 50 || !jsonmlAttrs[cleanAttributeName]
 		|| !coreConfig.attributeValueDiffing || mutation.target.hasAttribute('op-throttle')) {
-		ops = [{ oi: newValue, p: path }];
+		ops = [{ od: oldValue, oi: newValue, p: path }];
 	} else {
 		ops = patchesToOps(path, jsonmlAttrs[cleanAttributeName], newValue);
 	}
@@ -132,7 +130,11 @@ function characterDataMutation(mutation, targetPathNode) {
 	const isComment = mutation.target.nodeType === document.COMMENT_NODE;
 	const path = targetPathNode.toPath();
 
-	const oldValue = coreDatabase.elementAtPath(path); //mutation.oldValue;
+	const pathElement = coreDatabase.elementAtPath(path);
+	// The old value at the path must be a string for us to be able to create patches. However, if
+	// nothing exists there, we'll get the parent element.
+	let oldValue = (typeof pathElement === 'string' && pathElement) || '';
+
 	const newValue = mutation.target.data.replace(/ /g, ' ');
 
 	/*if (!isComment && coreDatabase.elementAtPath(path) !== oldValue) {
@@ -141,7 +143,13 @@ function characterDataMutation(mutation, targetPathNode) {
 		return;
 	}*/
 
-	let ops = patchesToOps(path, oldValue, newValue);
+	let ops;
+	if (mutation.target.parentElement && mutation.target.parentElement.hasAttribute('op-compose')) {
+		oldValue = mutation.target.futureContents || oldValue;
+		mutation.target.futureContents = newValue;
+	}
+
+	ops = patchesToOps(path, oldValue, newValue);
 	if (isComment) {
 		ops[0].p.splice(ops[0].p.length - 1, 0, 1);
 	}
@@ -159,7 +167,14 @@ function characterDataMutation(mutation, targetPathNode) {
 		} else if ('sd' in op) {
 			type = 'DOMTextNodeDeletion';
 			value = op.sd;
+		} else if ('od' in op) {
+			type = 'DOMNodeDeleted';
+			value = op.od;
+		} if ('oi' in op) {
+			type = 'DOMNodeInserted';
+			value = op.oi;
 		}
+
 		coreEvents.triggerEvent(type, mutation.target, parentElement, charIndex, value, true);
 	});
 
@@ -249,7 +264,7 @@ function childListMutation(mutation, targetPathNode) {
 
 		// If we can't create path node, it can't been registered in the JsonML at all, so creating
 		// an op for it doesn't make sense. This happens for instance with transient elements.
-		var newPathNode = corePathTree.create(addedNode, targetPathNode);
+		const newPathNode = corePathTree.create(addedNode, targetPathNode);
 		if (!newPathNode) {
 			coreEvents.triggerEvent('DOMNodeInserted', addedNode, mutation.target, true);
 			return;
@@ -261,17 +276,22 @@ function childListMutation(mutation, targetPathNode) {
 		// traverse the list of previous siblings until we find one that does have a webstrate object.
 		// Transient elements (outside of template tags) will righfully be absent from the pathtree,
 		// and thus not have webstrate objects.
-		var previousSibling = mutation.previousSibling;
-		var previousSiblingPathNode = corePathTree.getPathNode(previousSibling, parentNode);
+		// We have to use addedNode.previousSibling and not mutation.previousSibling, as this will
+		// refer to the previousSibling when the element was inserted. If multiple elements (B, C) have
+		// been inserted after element A, one after the each other, in one tick,
+		// mutation.previousSibling will refer to A for both mutations, but mutation.previousSibling
+		// will refer to A and B, respectively.
+		let previousSibling = addedNode.previousSibling;
+		let previousSiblingPathNode = corePathTree.getPathNode(previousSibling, parentNode);
 		while (previousSibling && !previousSiblingPathNode) {
 			previousSibling = previousSibling.previousSibling;
 			previousSiblingPathNode = corePathTree.getPathNode(previousSibling, parentNode);
 		}
 
 		if (previousSibling) {
-			var previousSiblingIndex = targetPathNode.children.indexOf(previousSiblingPathNode);
+			const previousSiblingIndex = targetPathNode.children.indexOf(previousSiblingPathNode);
 			targetPathNode.children.splice(previousSiblingIndex + 1, 0, newPathNode);
-		} else if (mutation.nextSibling) {
+		} else if (addedNode.nextSibling) {
 			targetPathNode.children.unshift(newPathNode);
 		} else {
 			targetPathNode.children.push(newPathNode);
@@ -352,7 +372,7 @@ coreOpCreator.emitOpsFromMutations = () => {
 			return;
 		}
 
-		// If we get here, op-throttle doesn't exist, so there's no need for a a (potentially) old
+		// If we get here, op-throttle doesn't exist, so there's no need for a (potentially) old
 		// throttle function that we're no longer using.
 		if (targetPathNode) {
 			targetPathNode.throttleFn = null;
@@ -360,7 +380,7 @@ coreOpCreator.emitOpsFromMutations = () => {
 
 		// When setting the op-compose attribute on an element with a number N as the value, all
 		// changes made to that element will be composed to only send ops at most every N
-		// milliseconds. All mutations that has occured since the last trigger will be composed into
+		// milliseconds. All mutations that have occured since the last trigger will be composed into
 		// (hopefully) fewer ops that will be sent as a group, speeding up the processing of them.
 		// This can be useful when a lot of essential (i.e. ones we can't throw out like with
 		// op-throttle) ops are created and performance is suffering.
@@ -374,7 +394,7 @@ coreOpCreator.emitOpsFromMutations = () => {
 			if (!elementPathNode.composeFn || elementPathNode.composeDelay !== composeDelay) {
 				elementPathNode.composeDelay = composeDelay;
 				targetPathNode.composedOps = ops;
-				elementPathNode.composeFn = coreUtils.throttleFn(() => {
+				elementPathNode.composeFn = coreUtils.throttleFn((targetPathNode) => {
 					if (targetPathNode.composedOps) {
 						coreEvents.triggerEvent('createdOps',
 							coreUtils.objectClone(targetPathNode.composedOps));
@@ -383,7 +403,7 @@ coreOpCreator.emitOpsFromMutations = () => {
 				}, composeDelay);
 			}
 
-			elementPathNode.composeFn();
+			elementPathNode.composeFn(targetPathNode);
 			return;
 		}
 

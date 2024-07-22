@@ -1,6 +1,6 @@
 'use strict';
 
-const fs = require('fs');
+const fs = require('graceful-fs');
 const util = require('util');
 const multer = require('multer');
 const db = require(APP_PATH + '/helpers/database.js');
@@ -103,10 +103,15 @@ const findDuplicateAsset = (asset) =>
  * @return {array}                (async) List of assets.
  * @public
  */
-module.exports.getAssets = function(webstrateId, next) {
+module.exports.getAssets = function(webstrateId, next, latestOnly = false) {
 	return db.assets.find({ webstrateId }, { _id: 0, _originalId: 0, webstrateId: 0 })
 		.toArray(function(err, assets) {
 			if (err) return next && next(err);
+			
+			if(latestOnly) {
+				assets = filterNewestAssets(assets);
+			}
+			
 			assets.forEach(function(asset) {
 				asset.identifier = asset.fileName;
 				asset.fileName = asset.originalFileName;
@@ -128,6 +133,8 @@ module.exports.getCurrentAssets = function(webstrateId, next) {
 		.toArray(function(err, assets) {
 			if (err) return next && next(err);
 			assets = filterNewestAssets(assets);
+			// Filter out deleted assets.
+			assets = assets.filter(asset => !asset.deletedAt);
 			return next(null, assets);
 		});
 };
@@ -142,11 +149,39 @@ module.exports.getCurrentAssets = function(webstrateId, next) {
  * @public
  */
 module.exports.getAsset = async function({ webstrateId, assetName, version }) {
-	var query = { webstrateId, originalFileName: assetName };
-	if (version) query.v = { $lte: +version };
-	const assets = await db.assets.find(query).sort({ v: -1 }).limit(1).toArray();
-	return assets[0];
+	version = Number.parseInt(version);
+	const query = { webstrateId, originalFileName: assetName };
+	if (version) query.v = { $lte: version };
+	const asset = await db.assets.findOne(query, { sort: { v: -1 } });
+	if (!asset) return undefined;
+	// If the asset has been deleted (i.e. deletedAt exists), we only serve the asset if it's being
+	// requested at a version prior to its deletion. E.g. if it was deleted at version 5, it should
+	// still be accessible at version 3, otherwise deletions would break history.
+	if (asset.deletedAt && ((version && asset.deletedAt <= version) || !version)) return undefined;
+	return asset;
 };
+
+/**
+ * Mark an asset as deleted at a version. This doesn't actually delete the asset from the database
+ * or disk, but just marks the asset in the database as deleted. This means that when trying to
+ * access the asset at the specific version (or later), it'll appear as if it doesn't exist. When
+ * downloading a webstrate at the version (or later), the asset will also not appear in the archive.
+ * @param  {string}   webstrateId      WebstrateId.
+ * @param  {string}   assetName        Asset name.
+ * @param  {Function} next             Callback.
+ * @public
+ */
+module.exports.markAssetAsDeleted = (webstrateId, assetName) => new Promise((accept, reject) => {
+	documentManager.getDocumentVersion(webstrateId, (err, version) => {
+		db.assets.findOneAndUpdate({ webstrateId, originalFileName: assetName, },
+			{ $set: { deletedAt: version } },
+			// Sort to ensure that we mark the newest verison of the file as deleted.
+			{ sort: { v: -1 } }, (err, res) => {
+				if (err || res.value === null) return reject(new Error('Update failed'));
+				return accept(res.value);
+			});
+	});
+});
 
 /**
  * Delete asset from database. This is useful if, for some reason, an asset no longer exists in
@@ -235,15 +270,19 @@ module.exports.restoreAssets = function({ webstrateId, version, tag, newVersion 
 	}
 
 	var query = { webstrateId, v: { $lte: version } };
-	db.assets.find(query, { _id: 0 }).toArray(function(err, assets) {
-
+	db.assets.find(query).toArray(function(err, assets) {
 		// If there are no assets, we can terminate.
 		if (assets.length === 0) return next();
 
 		if (err) return next && next(err);
 		assets = filterNewestAssets(assets);
+		
 		// Bump the version of all copied assets.
-		assets.forEach(asset => asset.v = newVersion);
+		assets.forEach((asset) => {
+		     asset.v = newVersion;
+		     delete asset._id;
+		});
+		
 		db.assets.insertMany(assets, next);
 	});
 };
@@ -330,7 +369,7 @@ function filterNewestAssets(assets) {
 module.exports.addAsset = function(webstrateId, asset, searchable, source, next) {
 	return documentManager.sendNoOp(webstrateId, 'assetAdded', source, function() {
 		return documentManager.getDocumentVersion(webstrateId, function(err, version) {
-			db.assets.insert({
+			db.assets.insertOne({
 				webstrateId,
 				v: version,
 				// asset.filename is the name of the file on our system, originalname is what the file was
@@ -359,11 +398,7 @@ module.exports.addAsset = function(webstrateId, asset, searchable, source, next)
 				};
 
 				// Inform all clients of the newly added asset.
-				clientManager.sendToClients(webstrateId, {
-					wa: 'asset',
-					d: webstrateId,
-					asset: asset,
-				});
+				clientManager.announceNewAsset(webstrateId, asset, true);
 
 				return next && next(null, asset);
 			});
@@ -409,23 +444,20 @@ module.exports.addAssets = function(webstrateId, assets, searchables, source, ne
  * @return {bool}          (async) Whether the file is permitted to be uploaded or not.
  * @private
  */
-function fileFilter(req, file, next) {
-	return documentManager.getDocument({ webstrateId: req.webstrateId }, function(err, snapshot) {
-		if (err) {
-			return next(err);
-		}
+async function fileFilter(req, file, next) {
+	const snapshot = await util.promisify(documentManager.getDocument)({
+		webstrateId: req.webstrateId });
 
-		if (!snapshot.type) {
-			return next(new Error('Document doesn\'t exist.'));
-		}
+	if (!snapshot.type) {
+		return next(new Error('Document doesn\'t exist.'));
+	}
 
-		var permissions = permissionManager.getUserPermissionsFromSnapshot(req.user.username,
-			req.user.provider, snapshot);
+	const permissions = await permissionManager.getUserPermissionsFromSnapshot(req.user.username,
+		req.user.provider, snapshot);
 
-		if (!permissions.includes('w')) {
-			return next(new Error('Insufficient permissions.'));
-		}
+	if (!permissions.includes('w')) {
+		return next(new Error('Insufficient permissions.'));
+	}
 
-		return next(null, true);
-	});
+	return next(null, true);
 }

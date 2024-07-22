@@ -23,6 +23,8 @@ describe('Transient Tags', function() {
 	});
 
 	after(async () => {
+		await pageA.goto(url + '?delete', { waitUntil: 'domcontentloaded' });
+
 		await browser.close();
 	});
 
@@ -135,12 +137,12 @@ describe('Transient Tags', function() {
 		});
 
 		await util.sleep(.5);
-		assert.equal(error, false, 'error before reload');
+		assert.equal(error, false, 'error before reload: ' + error);
 
 		await pageA.reload({ waitUntil: 'networkidle2' });
 
 		await util.sleep(.5);
-		assert.equal(error, false, 'error after reload');
+		assert.equal(error, false, 'error after reload: ' + error);
 	});
 
 	it('can set custom-transient attribute on body', async () => {

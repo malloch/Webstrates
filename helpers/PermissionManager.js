@@ -1,5 +1,6 @@
 'use strict';
 
+const util = require('util');
 const shortId = require('shortid');
 const redis = require('redis');
 const documentManager = require(global.APP_PATH + '/helpers/DocumentManager.js');
@@ -14,7 +15,7 @@ var authConfig = global.config.auth;
 
 var accessTokens = {};
 var permissionsCache = {};
-var timeToLive = authConfig && authConfig.permissionTimeout || 300;
+var timeToLive = authConfig && authConfig.permissionTimeout || 120;
 var defaultPermissionsList = authConfig && authConfig.defaultPermissions;
 
 // Listen for events happening on other server instances. This is only used when using multi-
@@ -50,6 +51,30 @@ if (pubsub) {
 }
 
 /**
+ * Determines whether a user is allowed to create a webstrate.
+ * @param  {Object} user User object (retrieved from the request object).
+ * @return {boolean}     True if allowed to create a webstrate, false otherwise.
+ * @public
+ */
+module.exports.userIsAllowedToCreateWebstrate = (user) => {
+	// All users are allowed.
+	if (!config.loggedInToCreateWebstrates) return true;
+
+	// If not all users are allowed, and the user isn't logged in.
+	if (user.provider === '') return false;
+
+	// If loggedInToCreateWebstrates is set to an array, the provider must be in the array to be
+	// allowed to create a webstrate.
+	if (Array.isArray(config.loggedInToCreateWebstrates)
+		&& !config.loggedInToCreateWebstrates.includes(user.provider))
+		return false;
+
+	// Otherwise, if loggedInToCreateWebstrates is just a boolean, any logged in user is allowed to
+	// create a webstrate.
+	return true;
+};
+
+/**
  * Get user object from access token.
  * @param  {string} webstrateId WebstrateId
  * @param  {string} token       Access token.
@@ -68,7 +93,7 @@ module.exports.getUserFromAccessToken = function(webstrateId, token) {
 		return;
 	}
 
-	return { username, provider };
+	return { username, provider, userId: username + ':' + provider };
 };
 
 /**
@@ -78,6 +103,7 @@ module.exports.getUserFromAccessToken = function(webstrateId, token) {
  * @public
  */
 module.exports.generateAccessToken = function(req, res) {
+	// Don't allow users accessing with a token to generate another token.
 	if (req.user.token) {
 		return res.status(403).send('Insufficient permission. Cannot generate access token from ' +
 		'token-based access (cannot generate tokens using tokens).');
@@ -161,10 +187,11 @@ module.exports.getAccessTokens = function(webstrateId) {
  *                             local cache invalidation requests, otherwise we end up in a
  *                             livelock where we continuously send the same request back and forth
  *                             between instances.
+ * @public
  */
 module.exports.expireAccessToken = function(webstrateId, token, local) {
 	if (accessTokens[webstrateId]) {
-		accessTokens[webstrateId][token];
+		delete accessTokens[webstrateId][token];
 	}
 
 	// Even if the access token doesn't exist locally, we still publish it to the other instances.
@@ -184,6 +211,7 @@ module.exports.expireAccessToken = function(webstrateId, token, local) {
  *                             local cache invalidation requests, otherwise we end up in a
  *                             livelock where we continuously send the same request back and forth
  *                             between instances.
+ * @public
  */
 module.exports.expireAllAccessTokens = function(webstrateId, local) {
 	delete accessTokens[webstrateId];
@@ -196,6 +224,18 @@ module.exports.expireAllAccessTokens = function(webstrateId, local) {
 };
 
 /**
+ * Check if configuration option is set so users must be logged in to write in a webstrate
+ * and the given user is anonymous
+ * @param  {string}   username    Username.
+ * @param  {string}   provider    Login provider (GitHub, Facebook, OAuth, ...).
+ * @return {bool}                 The configuration option is set and the user is anonymous.
+ * @private
+ */
+function userMustBeLoggedInToWriteAndUserIsAnonymous(username, provider) {
+	return global.config.loggedInToWrite && username === 'anonymous' && provider === '';
+}
+
+/**
  * Get a user's permissions for a specific webstrateId.
  * @param  {string}   username    Username.
  * @param  {string}   provider    Login provider (GitHub, Facebook, OAuth, ...).
@@ -204,25 +244,52 @@ module.exports.expireAllAccessTokens = function(webstrateId, local) {
  * @return {mixed}                (async) Error, Document permissions (r, rw).
  * @public
  */
-module.exports.getUserPermissions = function(username, provider, webstrateId, next) {
+module.exports.getUserPermissions = async function(username, provider, webstrateId) {
 	if (!webstrateId) {
-		return next(new Error('Missing webstrateId'), null);
+		throw new Error('Missing webstrateId');
 	}
 
-	var permissions = getCachedPermissions(username, provider, webstrateId);
+	let permissions = getCachedPermissions(username, provider, webstrateId);
 	if (permissions) {
-		return next(null, permissions);
+		return permissions;
 	}
 
-	documentManager.getDocument({ webstrateId }, function(err, snapshot) {
-		if (err) {
-			return next(err);
-		}
+	const snapshot = await util.promisify(documentManager.getDocument)({ webstrateId });
+	permissions = await module.exports.getUserPermissionsFromSnapshot(username, provider,
+		snapshot);
 
-		var permissions = module.exports.getUserPermissionsFromSnapshot(username, provider, snapshot);
-		setCachedPermissions(username, provider, permissions, snapshot.id);
-		next(null, permissions);
-	});
+	if (userMustBeLoggedInToWriteAndUserIsAnonymous(username, provider)) {
+		permissions = permissions.replace(/w/g, '');
+	}
+	setCachedPermissions(username, provider, permissions, snapshot.id);
+	return permissions;
+};
+
+/**
+ * Get all permissions from a webstrate.
+ * @param  {string} webstrateId WebstrateId.
+ * @return {[type]}             List of permissions from webstrate.
+ * @private
+ */
+async function getPermissions(webstrateId) {
+	const snapshot = await util.promisify(documentManager.getDocument)({ webstrateId });
+	return await module.exports.getPermissionsFromSnapshot(snapshot, false);
+}
+
+/**
+ * Whether a user in the permissions list has the 'a' (admin) flag set, in which case any changes
+ * made to the permissions list (data-auth property on the HTML element) has to be made by an admin.
+ * I.e. a user with the regular `w` write permission will be unable.
+ * @param  {string} webstrateId WebstrateId.
+ * @return {bool}               Whether a user with the `a` property exists.
+ * @public
+ */
+module.exports.webstrateHasAdmin = async (webstrateId) => {
+	const permissions = await getPermissions(webstrateId);
+	if (!permissions) return false;
+
+	return permissions.some(permissionObject =>
+		permissionObject.permissions && permissionObject.permissions.includes('a'));
 };
 
 /**
@@ -233,8 +300,8 @@ module.exports.getUserPermissions = function(username, provider, webstrateId, ne
  * @return {string}          Document permissions (r, rw).
  * @public
  */
-module.exports.getUserPermissionsFromSnapshot = function(username, provider, snapshot) {
-	var permissionsList = module.exports.getPermissionsFromSnapshot(snapshot);
+module.exports.getUserPermissionsFromSnapshot = async (username, provider, snapshot) => {
+	const permissionsList = await module.exports.getPermissionsFromSnapshot(snapshot);
 
 	// If there's also no default permissions, we pretend every user has read-write permissions
 	// lest we lock everybody out. We append a question mark to let the system know that these are
@@ -246,15 +313,21 @@ module.exports.getUserPermissionsFromSnapshot = function(username, provider, sna
 	return getUserPermissionsFromPermissionsList(username, provider, permissionsList);
 };
 
+const ALLOWED_RECURSIVE_INHERITANCES = 3;
 /**
  * Get all permissions from a specific snapshot.
  * @param  {JsonML} snapshot              ShareDB document snapshot.
  * @param  {bool}   useDefaultPermissions Whether to return default permissions or not if no
  *                                        permissions were found. true uses defaultPermissions.
- * @return {array}                       Permissions list.
+ * @param {integer} recursionCount        If webstrate X inherits permissions from webstrate Y, and
+ *                                        Y inherits from X, we'll end up in an infinite loop. So
+ *                                        we set a limit of how many recursive inheritances we
+ *                                        allow.
+ * @return {array}                        Permissions list.
  * @public
  */
-module.exports.getPermissionsFromSnapshot = function(snapshot, useDefaultPermissions = true) {
+module.exports.getPermissionsFromSnapshot = async function(snapshot, useDefaultPermissions = true,
+	recursionCount = 0) {
 	var permissionsList;
 
 	if (snapshot && snapshot.data && snapshot.data[0] && snapshot.data[0] === 'html' &&
@@ -267,18 +340,55 @@ module.exports.getPermissionsFromSnapshot = function(snapshot, useDefaultPermiss
 			// We don't have to do anything. No valid document permissions.
 		}
 
-		// If we found permissions, return them.
-		if (Array.isArray(permissionsList) && Object.keys(permissionsList).length > 0) {
+		// We allow a certain number of recursive permission inheritances, i.e. webstrate X inheriting
+		// permissions from Y, inheriting from Z, and so forth. If this is exceeded, we ignore the
+		// "deeper" permissions (and also log a warning on the server).
+		if (recursionCount > ALLOWED_RECURSIVE_INHERITANCES) {
+			console.warn('Too many recursive inheritances in', snapshot.id);
 			return permissionsList;
 		}
+
+		// Add all permissions to permissionsList by side effect. This is faster than creating new
+		// arrays and copying stuff around.
+		await getInheritedPermissions(permissionsList, recursionCount + 1);
+
+		return permissionsList;
 	}
 
-	if (useDefaultPermissions) {
-		return defaultPermissionsList;
+	// If we found no permissions, return default permissions, unless specified otherwise.
+	if (useDefaultPermissions && (!Array.isArray(permissionsList) || Object.keys(permissionsList).length === 0)) {
+		return useDefaultPermissions ? defaultPermissionsList : undefined;
 	}
 
 	return undefined;
 };
+
+async function getInheritedPermissions(permissionsList, recursionCount) {
+
+	const inheritWebstrateIds = permissionsList.filter(o => o.webstrateId !== undefined);
+
+	// We do this "the slow way", i.e. not async/parallel, because somebody could otherwise easily
+	// DoS the server by forcing the server to fill up the memory with huge webstrate documents all
+	// at the same time.
+	// We expand the permissionsList in the loop, but we only iterate to the initial length, so we
+	// don't end up in a potential infinite loop if there are mutual recursions between webstrates.
+	for (let i = 0, l = permissionsList.length; i < l; ++i) {
+		const webstrateId = permissionsList[i].webstrateId;
+		if (webstrateId) {
+			const snapshot = await util.promisify(documentManager.getDocument)({ webstrateId });
+			const otherPermissionList = await module.exports.getPermissionsFromSnapshot(snapshot,
+				false, recursionCount);
+
+			// We don't want admin permissions to be inherited, so we remove the 'a' flag.
+			otherPermissionList.forEach(o => o.permissions = o.permissions.replace(/a/i, ''));
+
+			// Add all inherited permissions to the passed-in permissions list.
+			permissionsList.push(...otherPermissionList);
+		}
+	}
+	// We update permisisonsList above by side effects, but we return it anyway for good measure.
+	return permissionsList;
+}
 
 /**
  * Get a user's default permission.
@@ -304,47 +414,46 @@ module.exports.getDefaultPermissions = function(username, provider) {
  *                               don't have a one here, it should just be a userId.
  * @param {Function} next        Callback.
  * @public
+ * TODO: THIS SEEMS UNUSED, DELETE?
  */
-module.exports.addPermissions = function(username, provider, permissions, webstrateId, source,
+module.exports.addPermissions = async function(username, provider, permissions, webstrateId, source,
 	next) {
-	documentManager.getDocument({ webstrateId }, function(err, snapshot) {
-		if (err) {
-			return next(err);
-		}
+	let snapshot = await util.promisify(documentManager.getDocument)({ webstrateId });
 
-		if (!snapshot || !snapshot.data || !snapshot.data[0] || snapshot.data[0] !== 'html' ||
-			typeof snapshot.data[1] !== 'object') {
-			return next(new Error('Invalid document'));
-		}
+	if (!snapshot || !snapshot.data || !snapshot.data[0] || snapshot.data[0] !== 'html' ||
+		typeof snapshot.data[1] !== 'object') {
+		return next(new Error('Invalid document'));
+	}
 
-		var oldPermissions = snapshot.data[1]['data-auth'];
-		snapshot = module.exports.addPermissionsToSnapshot(username, provider, permissions, snapshot);
-		var newPermissions = snapshot.data[1]['data-auth'];
+	var oldPermissions = snapshot.data[1]['data-auth'];
+	snapshot = await module.exports.addPermissionsToSnapshot(username, provider, permissions,
+		snapshot);
+	var newPermissions = snapshot.data[1]['data-auth'];
 
-		var op = {
-			p: [1, 'data-auth'],
-			od: oldPermissions,
-			oi: newPermissions
-		};
+	var op = {
+		p: [1, 'data-auth'],
+		od: oldPermissions,
+		oi: newPermissions
+	};
 
-		documentManager.submitOp(webstrateId, op, source, next);
-	});
+	documentManager.submitOp(webstrateId, op, source, next);
 };
 
-module.exports.addPermissionsToSnapshot = function(username, provider, permissions, snapshot) {
-	var currentPermissions = module.exports.getUserPermissionsFromSnapshot(username, provider,
+module.exports.addPermissionsToSnapshot = async function(username, provider, permissions,
+	snapshot) {
+	const currentPermissions = await module.exports.getUserPermissionsFromSnapshot(username, provider,
 		snapshot);
 	if (currentPermissions === permissions) {
 		return snapshot;
 	}
 
-	var permissionsList = module.exports.getPermissionsFromSnapshot(snapshot, false) || [];
+	const permissionsList = await module.exports.getPermissionsFromSnapshot(snapshot, false) || [];
 
 	// Find index of the user's current permissions
-	var userIdx = permissionsList.findIndex(user =>
+	const userIdx = permissionsList.findIndex(user =>
 		user.username === username && user.provider === provider);
 
-	var user = { username, provider, permissions };
+	const user = { username, provider, permissions };
 
 	// If the user currently has no permissions, we add the new permissions, or otherwise modifies
 	// the existing permissions.
@@ -359,12 +468,28 @@ module.exports.addPermissionsToSnapshot = function(username, provider, permissio
 };
 
 /**
- * Remove all permissions from snapshot
+ * Remove all permissions from snapshot.
  * @param  {JsonML} snapshot ShareDB document snapshot.
  * @return {string}          ShareDB document snapshot without permissions.
  */
 module.exports.clearPermissionsFromSnapshot = function(snapshot) {
 	delete snapshot.data[1]['data-auth'];
+	return snapshot;
+};
+
+/**
+ * Remove admin permissions from snapshot.
+ * @param  {JsonML} snapshot ShareDB document snapshot.
+ * @return {string}          ShareDB document snapshot without admin permissions.
+ */
+module.exports.removeAdminPermissionsFromSnapshot = async function(snapshot) {
+	const permissionsList = await module.exports.getPermissionsFromSnapshot(snapshot, false);
+
+	if (permissionsList) {
+		permissionsList.forEach(user => user.permissions = user.permissions.replace(/a/gi, ''));
+		snapshot.data[1]['data-auth'] = JSON.stringify(permissionsList);
+	}
+
 	return snapshot;
 };
 

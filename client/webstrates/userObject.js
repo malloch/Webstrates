@@ -42,18 +42,26 @@ if (!coreUtils.getLocationObject().staticMode) {
 				if (!isOwnJoin && publicObject.clients) {
 					publicObject.clients.push(joiningClientId);
 				}
+				// Registers joins from the same user in other webstrates, from other devices, etc.
+				if (message.userClient && publicObject.allClients) {
+					publicObject.allClients[message.id] = message.userClient;
+				}
 				break;
 			}
 
 			// There is no specific 'userClientPart' command, because we can just try to remove all
 			// parting clients from the user clients list.
 			case 'clientPart': {
+				// ClientId and socketId are the same.
+				const partingClientId = message.id;
 				if (publicObject.clients) {
-					const partingClientId = message.id;
 					const userIdx = publicObject.clients.indexOf(partingClientId);
 					if (userIdx !== -1) {
 						publicObject.clients.splice(userIdx, 1);
 					}
+				}
+				if (publicObject.allClients) {
+					delete publicObject.allClients[partingClientId];
 				}
 				break;
 			}

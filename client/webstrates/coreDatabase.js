@@ -167,9 +167,10 @@ exports.fetch = (webstrateId, tagOrVersion) => {
  * is easy.
  * This does not return a promise, as we do not have control over exactly when the document gets
  * reverted as this is ShareDB's job.
- * @param  {string} tagOrVersion Tag label or version number.
+ * @param {string} tagOrVersion Tag label or version number.
+ * @param {Function} callback Callback
  */
-exports.restore = (webstrateId, tagOrVersion) => {
+exports.restore = (webstrateId, tagOrVersion, callback) => {
 	var msgObj = {
 		wa: 'restore',
 		d: webstrateId
@@ -181,7 +182,7 @@ exports.restore = (webstrateId, tagOrVersion) => {
 		msgObj.l = tagOrVersion;
 	}
 
-	coreWebsocket.send(msgObj);
+	coreWebsocket.send(msgObj, callback);
 };
 
 /**

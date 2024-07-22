@@ -25,6 +25,8 @@ describe('Script Insertion and Execution', function() {
 	});
 
 	after(async () => {
+		await pageA.goto(url + '?delete', { waitUntil: 'domcontentloaded' });
+
 		await browser.close();
 	});
 
@@ -45,13 +47,15 @@ describe('Script Insertion and Execution', function() {
 
 	it('inserting a script should not execute it on other client', async () => {
 		const scriptsRun = await util.waitForFunction(pageB, () =>
-			window.__scriptRunPre || window.__scriptRunPost || window.jQuery,);
+			window.__scriptRunPre || window.__scriptRunPost || window.jQuery);
 
 		assert.isFalse(scriptsRun);
 	});
 
 	it('scripts should get executed after reload', async () => {
 		await pageA.reload({ waitUntil: 'networkidle2' });
+
+		await util.waitForWebstrateLoaded(pageA);
 
 		const scriptsRun = await util.waitForFunction(pageA, () =>
 			window.__scriptRunPre && window.__scriptRunPost && window.jQuery, 1);

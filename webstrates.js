@@ -83,34 +83,46 @@ if (config.auth) {
 	passport.serializeUser(sessionManager.serializeUser);
 	passport.deserializeUser(sessionManager.deserializeUser);
 
-	for (var key in config.auth.providers) {
-		var PassportStrategy = require(config.auth.providers[key].node_module).Strategy;
-		passport.use(new PassportStrategy(config.auth.providers[key].config,
-			function(request, accessToken, refreshToken, profile, done) {
-				return process.nextTick(function() {
-					return done(null, profile);
-				});
-			}));
+	for (let key in config.auth.providers) {
+		const PassportStrategy = require(config.auth.providers[key].node_module).Strategy;
+		const passportInstance = new PassportStrategy(config.auth.providers[key].config,
+			(request, accessToken, refreshToken, profile, done) => {
+				profile.provider = key;
+				process.nextTick(() => done(null, profile));
+			});
+		config.auth.providers[key].name = passportInstance.name;
+		passport.use(passportInstance);
 	}
 
 	app.use(passport.initialize());
 	app.use(passport.session());
 
-	for (var provider in config.auth.providers) {		
-		app.get('/auth/' + provider, 
-			passport.authenticate(provider, config.auth.providers[provider].authOptions), 
-			function(req, res) {});
-		app.get('/auth/' + provider + '/callback', passport.authenticate(provider, {
-			failureRedirect: '/auth/' + provider
+	for (let key in config.auth.providers) {
+		const strategy = config.auth.providers[key].name;
+		app.get('/auth/' + key,
+			(req, res, next) => {
+				let referer = req.header('referer');
+				if (req.query.webstrateId) {
+					const origin = new URL(req.header('referer')).origin;
+					referer = origin + '/' + req.query.webstrateId;
+				}
+				req.session.referer = referer;
+				next();
+			},
+			passport.authenticate(strategy, config.auth.providers[key].authOptions));
+		app.get('/auth/' + key + '/callback', passport.authenticate(strategy, {
+			failureRedirect: '/auth/' + key
 		}), function(req, res) {
-			return res.redirect('/');
+			let referer = req.session.referer;
+			delete req.session.referer;
+			res.redirect(referer || '/');
 		});
-		if (WORKER_ID === 1) console.log(provider + '-based authentication enabled');
+		if (WORKER_ID === 1) console.log(strategy + '-based authentication enabled');
 	}
 
 	app.get('/auth/logout', function(req, res) {
 		req.logout();
-		return res.redirect('/');
+		res.redirect(req.header('referer') || '/');
 	});
 }
 
@@ -120,11 +132,13 @@ app.get(/^\/([A-Z0-9._-]+)(\/([A-Z0-9_-]+))?$/i,
 
 // This middleware gets triggered on both regular HTTP request and websocket connections.
 app.use(function(req, res, next) {
-	sessionMiddleware(req, null, next);
+	sessionMiddleware(req, res, next);
 });
 
 app.get('/', httpRequestController.rootRequestHandler);
-app.get('/new', httpRequestController.newWebstrateRequestHandler);
+app.get('/new', httpRequestController.newWebstrateGetRequestHandler);
+app.post('/new', httpRequestController.extractQuery,
+	httpRequestController.newWebstratePostRequestHandler);
 
 // Matches /<webstrateId>/(<tagOrVersion>)?//<assetName>)?
 // Handles mostly all requests.
@@ -177,19 +191,18 @@ const sessionMiddleware = function(req, res, next) {
 
 	if (req.query.token) {
 		const userObj = permissionManager.getUserFromAccessToken(webstrateId, req.query.token);
-		if (userObj) {
-			req.user.token = req.query.token;
-			req.user.username = userObj.username;
-			req.user.provider = userObj.provider;
+		if (!userObj) {
+			if (req.ws) req.ws.close(1002, 'Invalid access token.');
+			else res.status(403).send('Invalid access token.');
+			return;
 		}
-		else if (res) {
-			return res.status(403).send('Invalid access token.');
-		}
+		req.user = userObj;
+		req.user.token = req.query.token;
 	}
 
 	req.user.username = req.user.username || req.user.email || req.user.id || 'anonymous';
-	req.user.provider = req.user.provider || '';
-	req.user.userId = req.user.username + ':' + req.user.provider;
+	req.user.provider = req.user.providerName || req.user.provider || '';
+	req.user.userId = req.user.userId || (req.user.username + ':' + req.user.provider);
 	req.webstrateId = webstrateId;
 	next();
 };
@@ -201,6 +214,7 @@ middleware.push(require('./middleware/keepAliveMiddleware.js'));
 if (config.godApi) {
 	middleware.push(require('./middleware/godApiMiddleware.js'));
 }
+middleware.push(require('./middleware/userHistory.js'));
 middleware.push(require('./middleware/customActionHandlerMiddleware.js'));
 middleware.push(require('./middleware/shareDbMiddleware.js'));
 
@@ -218,8 +232,10 @@ function runMiddleware(type, args, middleware, ...middlewares) {
 }
 
 app.ws('*', (ws, req) => {
-	var socketId = clientManager.addClient(ws, req.user);
+	const socketId = clientManager.addClient(ws, req, req.user);
 	req.socketId = socketId;
+
+	req.socket.setTimeout(30 * 1000);
 
 	// We replace `ws.send` with a function that doesn't throw an exception if the message fails.
 	ws.__send = ws.send;
@@ -227,14 +243,19 @@ app.ws('*', (ws, req) => {
 		try {
 			ws.__send(data);
 		} catch (err) {
-			console.error(req.socketId, data + ':', err);
-			ws.close();
+			ws.close(err);
 			return false;
 		}
 		return true;
 	};
 
-	runMiddleware('onconnect', [ws, req], ...middleware);
+	ws.on('error', err => {
+		ws.close(err);
+	});
+
+	ws.on('close', reason => {
+		runMiddleware('onclose', [ws, req, reason], ...middleware);
+	});
 
 	ws.on('message', data => {
 		try {
@@ -246,10 +267,7 @@ app.ws('*', (ws, req) => {
 		runMiddleware('onmessage', [ws, req, data], ...middleware);
 	});
 
-	ws.on('close', reason => {
-		runMiddleware('onclose', [ws, req, reason], ...middleware);
-	});
-
+	runMiddleware('onconnect', [ws, req], ...middleware);
 });
 
 app.use((err, req, res, next) => {
